@@ -16,5 +16,14 @@ MonsterHunterWilds.exe
 
 This list is case insensitive and the .exe is optional. You can edit your custom list by clicking "Edit custom game list" in the system tray menu. You may choose to use either the default list, the custom list, or both.
 
+## Building from source
+Install [Rust](https://www.rust-lang.org/tools/install), then clone this repository and run:
+
+```powershell
+cargo build --release
+```
+
+The compiled executable will be created at `target/release/hdr-auto.exe`.
+
 ## Contributing
 You may contribute to the community list by editing the games_default.txt and creating a pull request. Please ensure the game you add is not already in the list, and is listed as "Native support" on the [PCGamingWiki HDR Page](https://www.pcgamingwiki.com/wiki/List_of_games_that_support_high_dynamic_range_display_(HDR)). Also ensure the .exe name is correct by running it on your computer and checking the HDR toggles on as intended.
