@@ -14,7 +14,9 @@ DOOMTheDarkAges.exe
 MonsterHunterWilds.exe
 ```
 
-This list is case insensitive and the .exe is optional. You can edit your custom list by clicking "Edit custom game list" in the system tray menu. You may choose to use either the default list, the custom list, or both.
+The custom list is always active and may be left empty. Entries are case insensitive and the `.exe` extension is optional for executable names. You can edit it by clicking "Edit custom game list" in the system tray menu.
+
+Use "Edit exclusion list" to prevent entries from either the community or custom list from triggering HDR. Both lists also accept full executable paths. A filename such as `launcher.exe` matches that executable anywhere, while a full path such as `D:\Games\launcher.exe` matches only that exact executable. Full-path entries should include the `.exe` extension.
 
 ## Building from source
 Install [Rust](https://www.rust-lang.org/tools/install), then clone this repository and run:

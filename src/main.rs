@@ -37,6 +37,7 @@ mod app {
             errhandlingapi::{GetLastError, SetLastError},
             handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
             libloaderapi::GetModuleHandleW,
+            processthreadsapi::OpenProcess,
             shellapi::{
                 Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
                 NOTIFYICONDATAW,
@@ -47,6 +48,7 @@ mod app {
                 TH32CS_SNAPPROCESS,
             },
             unknwnbase::IUnknown,
+            winbase::QueryFullProcessImageNameW,
             wingdi::{
                 DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
                 DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -80,8 +82,8 @@ mod app {
     const WM_TRAY_ICON: UINT = WM_APP + 1;
     const MENU_TOGGLE_HDR: usize = 1001;
     const MENU_USE_DEFAULT_LIST: usize = 1002;
-    const MENU_USE_CUSTOM_LIST: usize = 1003;
     const MENU_EDIT_CUSTOM_LIST: usize = 1004;
+    const MENU_EDIT_EXCLUSION_LIST: usize = 1007;
     const MENU_RUN_AT_STARTUP: usize = 1005;
     const MENU_QUIT: usize = 1006;
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -94,7 +96,7 @@ mod app {
     const GAME_LIST_DEFAULT_FLAG: usize = 0b01;
     const GAME_LIST_CUSTOM_FLAG: usize = 0b10;
     const ALL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG | GAME_LIST_CUSTOM_FLAG;
-    const INITIAL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG;
+    const INITIAL_GAME_LIST_FLAGS: usize = ALL_GAME_LIST_FLAGS;
     const GAME_LIST_DOWNLOAD_TIMEOUT_MS: DWORD = 5_000;
     const HTTP_STATUS_OK: DWORD = 200;
     const INTERNET_OPEN_TYPE_PRECONFIG: DWORD = 0;
@@ -296,6 +298,7 @@ mod app {
     struct GameListPaths {
         default: PathBuf,
         custom: PathBuf,
+        exclusions: PathBuf,
     }
 
     fn game_list_paths() -> io::Result<GameListPaths> {
@@ -303,6 +306,7 @@ mod app {
         Ok(GameListPaths {
             default: base_dir.join("games_default.txt"),
             custom: base_dir.join("games_custom.txt"),
+            exclusions: base_dir.join("games_excluded.txt"),
         })
     }
 
@@ -322,9 +326,13 @@ mod app {
     }
 
     fn has_game_list_file(dir: &Path) -> bool {
-        ["games_default.txt", "games_custom.txt"]
-            .iter()
-            .any(|name| dir.join(name).exists())
+        [
+            "games_default.txt",
+            "games_custom.txt",
+            "games_excluded.txt",
+        ]
+        .iter()
+        .any(|name| dir.join(name).exists())
     }
 
     fn ensure_game_list_files(paths: &GameListPaths) -> io::Result<()> {
@@ -346,6 +354,10 @@ mod app {
 
         if !paths.custom.exists() {
             fs::write(&paths.custom, "")?;
+        }
+
+        if !paths.exclusions.exists() {
+            fs::write(&paths.exclusions, "")?;
         }
 
         Ok(())
@@ -521,7 +533,8 @@ mod app {
         while !quit.load(Ordering::SeqCst) {
             let game_list_flags = active_game_list_flags.load(Ordering::SeqCst);
             let games = load_game_list(&game_list_paths, game_list_flags);
-            let is_running = match matching_game_processes(&games) {
+            let exclusions = load_list(&game_list_paths.exclusions);
+            let is_running = match matching_game_processes(&games, &exclusions) {
                 Ok(matches) => !matches.is_empty(),
                 Err(_) => {
                     sleep_until_next_poll(&quit);
@@ -559,10 +572,15 @@ mod app {
         if flags & GAME_LIST_DEFAULT_FLAG != 0 {
             append_game_list(&mut games, &mut seen, &paths.default);
         }
-        if flags & GAME_LIST_CUSTOM_FLAG != 0 {
-            append_game_list(&mut games, &mut seen, &paths.custom);
-        }
+        append_game_list(&mut games, &mut seen, &paths.custom);
         games
+    }
+
+    fn load_list(path: &Path) -> Vec<String> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        append_game_list(&mut entries, &mut seen, path);
+        entries
     }
 
     fn append_game_list(games: &mut Vec<String>, seen: &mut HashSet<String>, path: &Path) {
@@ -581,15 +599,30 @@ mod app {
             return None;
         }
 
-        let lower = name.to_ascii_lowercase();
-        Some(lower.strip_suffix(".exe").unwrap_or(&lower).to_string())
+        let lower = name.replace('/', "\\").to_ascii_lowercase();
+        if is_path_rule(&lower) {
+            Some(lower)
+        } else {
+            Some(lower.strip_suffix(".exe").unwrap_or(&lower).to_string())
+        }
     }
 
-    fn matching_game_processes(game_names: &[String]) -> io::Result<HashSet<String>> {
+    fn is_path_rule(value: &str) -> bool {
+        value.contains('\\') || Path::new(value).is_absolute()
+    }
+
+    fn matching_game_processes(
+        game_names: &[String],
+        exclusions: &[String],
+    ) -> io::Result<HashSet<String>> {
         let mut matches = HashSet::new();
         if game_names.is_empty() {
             return Ok(matches);
         }
+        let needs_path = game_names
+            .iter()
+            .chain(exclusions)
+            .any(|rule| is_path_rule(rule));
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
@@ -606,7 +639,12 @@ mod app {
 
         loop {
             let exe_name = fixed_wide_to_string(&entry.szExeFile);
-            if process_matches(&exe_name, game_names) {
+            let process_path = needs_path
+                .then(|| process_image_path(entry.th32ProcessID))
+                .flatten();
+            if process_matches(&exe_name, process_path.as_deref(), game_names)
+                && !process_matches(&exe_name, process_path.as_deref(), exclusions)
+            {
                 matches.insert(exe_name);
             }
 
@@ -616,6 +654,30 @@ mod app {
         }
 
         Ok(matches)
+    }
+
+    fn process_image_path(process_id: DWORD) -> Option<String> {
+        let handle = unsafe {
+            OpenProcess(
+                winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                process_id,
+            )
+        };
+        if handle.is_null() {
+            return None;
+        }
+        let _handle = SnapshotHandle(handle);
+        let mut buffer = vec![0u16; 32_768];
+        let mut len = buffer.len() as DWORD;
+        if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        Some(
+            String::from_utf16_lossy(&buffer[..len as usize])
+                .replace('/', "\\")
+                .to_ascii_lowercase(),
+        )
     }
 
     struct SnapshotHandle(winapi::shared::ntdef::HANDLE);
@@ -628,9 +690,12 @@ mod app {
         }
     }
 
-    fn process_matches(exe_name: &str, game_names: &[String]) -> bool {
+    fn process_matches(exe_name: &str, process_path: Option<&str>, game_names: &[String]) -> bool {
         let exe_key = normalize_process_key(exe_name);
         game_names.iter().any(|game| {
+            if is_path_rule(game) {
+                return process_path.is_some_and(|path| path.eq_ignore_ascii_case(game));
+            }
             if game == &exe_key {
                 return true;
             }
@@ -738,11 +803,11 @@ mod app {
                     MENU_USE_DEFAULT_LIST => {
                         toggle_game_list_flag(GAME_LIST_DEFAULT_FLAG);
                     }
-                    MENU_USE_CUSTOM_LIST => {
-                        toggle_game_list_flag(GAME_LIST_CUSTOM_FLAG);
-                    }
                     MENU_EDIT_CUSTOM_LIST => {
                         let _ = edit_custom_game_list();
+                    }
+                    MENU_EDIT_EXCLUSION_LIST => {
+                        let _ = edit_exclusion_list();
                     }
                     MENU_RUN_AT_STARTUP => {
                         let _ = set_startup_enabled(!startup_enabled());
@@ -781,8 +846,8 @@ mod app {
 
         let toggle = to_wide_null(toggle_hdr_menu_text());
         let default_list = to_wide_null("Use default game list");
-        let custom_list = to_wide_null("Use custom game list");
         let edit_custom_list = to_wide_null("Edit custom game list");
+        let edit_exclusion_list = to_wide_null("Edit exclusion list");
         let startup = to_wide_null("Run at Windows startup");
         let quit = to_wide_null("Quit");
         let current_game_list_flags = game_list_flags();
@@ -797,15 +862,15 @@ mod app {
         );
         AppendMenuW(
             menu,
-            MF_STRING | checked_if(current_game_list_flags & GAME_LIST_CUSTOM_FLAG != 0),
-            MENU_USE_CUSTOM_LIST,
-            custom_list.as_ptr(),
+            MF_STRING,
+            MENU_EDIT_CUSTOM_LIST,
+            edit_custom_list.as_ptr(),
         );
         AppendMenuW(
             menu,
             MF_STRING,
-            MENU_EDIT_CUSTOM_LIST,
-            edit_custom_list.as_ptr(),
+            MENU_EDIT_EXCLUSION_LIST,
+            edit_exclusion_list.as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
@@ -1214,13 +1279,20 @@ mod app {
     }
 
     fn sanitize_game_list_flags(flags: usize) -> usize {
-        flags & ALL_GAME_LIST_FLAGS
+        (flags & ALL_GAME_LIST_FLAGS) | GAME_LIST_CUSTOM_FLAG
     }
 
     fn edit_custom_game_list() -> io::Result<()> {
         let paths = game_list_paths()?;
         ensure_game_list_files(&paths)?;
         Command::new("notepad.exe").arg(&paths.custom).spawn()?;
+        Ok(())
+    }
+
+    fn edit_exclusion_list() -> io::Result<()> {
+        let paths = game_list_paths()?;
+        ensure_game_list_files(&paths)?;
+        Command::new("notepad.exe").arg(&paths.exclusions).spawn()?;
         Ok(())
     }
 
@@ -1730,6 +1802,7 @@ mod app {
             let paths = GameListPaths {
                 default: dir.join("games_default.txt"),
                 custom: dir.join("games_custom.txt"),
+                exclusions: dir.join("games_excluded.txt"),
             };
 
             fs::write(&paths.default, "Game.exe\n\"Other Game.exe\"\n")?;
@@ -1750,12 +1823,13 @@ mod app {
         }
 
         #[test]
-        fn load_game_list_returns_empty_when_no_lists_enabled() -> io::Result<()> {
+        fn custom_game_list_is_loaded_when_no_optional_lists_are_enabled() -> io::Result<()> {
             let dir = unique_temp_dir("empty");
             fs::create_dir_all(&dir)?;
             let paths = GameListPaths {
                 default: dir.join("games_default.txt"),
                 custom: dir.join("games_custom.txt"),
+                exclusions: dir.join("games_excluded.txt"),
             };
 
             fs::write(&paths.default, "game.exe\n")?;
@@ -1764,14 +1838,36 @@ mod app {
             let games = load_game_list(&paths, 0);
 
             fs::remove_dir_all(&dir)?;
-            assert!(games.is_empty());
+            assert_eq!(games, vec!["other".to_string()]);
             Ok(())
         }
 
         #[test]
         fn sanitize_game_list_flags_keeps_known_flags_only() {
             assert_eq!(sanitize_game_list_flags(usize::MAX), ALL_GAME_LIST_FLAGS);
-            assert_eq!(sanitize_game_list_flags(0), 0);
+            assert_eq!(sanitize_game_list_flags(0), GAME_LIST_CUSTOM_FLAG);
+        }
+
+        #[test]
+        fn full_path_rules_match_only_the_exact_process_path() {
+            let rules = vec![normalize_game_name(r"D:\Games\launcher.exe").unwrap()];
+
+            assert!(process_matches(
+                "launcher.exe",
+                Some(r"d:\games\launcher.exe"),
+                &rules
+            ));
+            assert!(!process_matches(
+                "launcher.exe",
+                Some(r"d:\other\launcher.exe"),
+                &rules
+            ));
+        }
+
+        #[test]
+        fn executable_name_rules_still_match_without_a_process_path() {
+            let rules = vec![normalize_game_name("launcher.exe").unwrap()];
+            assert!(process_matches("Launcher.exe", None, &rules));
         }
 
         #[test]
