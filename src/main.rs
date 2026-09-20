@@ -14,8 +14,8 @@ mod app {
         process::Command,
         ptr,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+            Arc, Condvar, Mutex, OnceLock,
         },
         thread,
         time::Duration,
@@ -82,6 +82,7 @@ mod app {
     const WM_TRAY_ICON: UINT = WM_APP + 1;
     const MENU_TOGGLE_HDR: usize = 1001;
     const MENU_USE_DEFAULT_LIST: usize = 1002;
+    const MENU_RELOAD_GAME_LISTS: usize = 1003;
     const MENU_EDIT_CUSTOM_LIST: usize = 1004;
     const MENU_EDIT_EXCLUSION_LIST: usize = 1007;
     const MENU_RUN_AT_STARTUP: usize = 1005;
@@ -115,8 +116,9 @@ mod app {
     const ADVANCED_COLOR_INFO_2_HDR_USER_ENABLED: u32 = 1 << 5;
     const SET_HDR_STATE_ENABLE_HDR: u32 = 1;
 
-    static QUIT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    static MONITOR_CONTROL: OnceLock<Arc<MonitorControl>> = OnceLock::new();
     static ACTIVE_GAME_LIST_FLAGS: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+    static GAME_LIST_PATHS: OnceLock<GameListPaths> = OnceLock::new();
     static TRAY_ICON_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
     const ICON_FILE_NAME: &str = "icon_tray.png";
@@ -227,26 +229,23 @@ mod app {
         ensure_game_list_files(&game_list_paths)?;
         let _ = refresh_default_game_list(&game_list_paths);
 
-        let quit = Arc::new(AtomicBool::new(false));
         let initial_game_list_flags =
             load_saved_game_list_flags().unwrap_or(INITIAL_GAME_LIST_FLAGS);
+        let initial_game_lists = Arc::new(load_cached_game_lists(
+            &game_list_paths,
+            initial_game_list_flags,
+        )?);
+        let monitor_control = Arc::new(MonitorControl::new(initial_game_lists));
         let active_game_list_flags = Arc::new(AtomicUsize::new(initial_game_list_flags));
-        let monitor_quit = Arc::clone(&quit);
-        let monitor_game_list_paths = game_list_paths.clone();
-        let monitor_game_list_flags = Arc::clone(&active_game_list_flags);
-        let _ = QUIT_FLAG.set(Arc::clone(&quit));
+        let monitor_thread_control = Arc::clone(&monitor_control);
+        let _ = MONITOR_CONTROL.set(Arc::clone(&monitor_control));
         let _ = ACTIVE_GAME_LIST_FLAGS.set(Arc::clone(&active_game_list_flags));
+        let _ = GAME_LIST_PATHS.set(game_list_paths);
 
-        let monitor = thread::spawn(move || {
-            monitor_games(
-                monitor_game_list_paths,
-                monitor_game_list_flags,
-                monitor_quit,
-            )
-        });
+        let monitor = thread::spawn(move || monitor_games(monitor_thread_control));
 
         let tray_result = unsafe { run_tray_app() };
-        quit.store(true, Ordering::SeqCst);
+        monitor_control.shutdown();
         let _ = monitor.join();
 
         tray_result
@@ -521,26 +520,111 @@ mod app {
         Ok(())
     }
 
-    fn monitor_games(
-        game_list_paths: GameListPaths,
-        active_game_list_flags: Arc<AtomicUsize>,
-        quit: Arc<AtomicBool>,
-    ) {
+    #[derive(Default)]
+    struct ProcessRules {
+        names: HashSet<String>,
+        paths: HashSet<String>,
+    }
+
+    impl ProcessRules {
+        fn from_entries(entries: Vec<String>) -> Self {
+            let mut rules = Self::default();
+            for entry in entries {
+                if is_path_rule(&entry) {
+                    rules.paths.insert(entry);
+                } else {
+                    rules.names.insert(normalize_process_key(&entry));
+                }
+            }
+            rules.names.remove("");
+            rules
+        }
+
+        fn needs_process_path(&self) -> bool {
+            !self.paths.is_empty()
+        }
+    }
+
+    struct CachedGameLists {
+        games: ProcessRules,
+        exclusions: ProcessRules,
+    }
+
+    struct MonitorState {
+        game_lists: Arc<CachedGameLists>,
+        revision: u64,
+        quit: bool,
+    }
+
+    struct MonitorControl {
+        state: Mutex<MonitorState>,
+        wake: Condvar,
+    }
+
+    impl MonitorControl {
+        fn new(game_lists: Arc<CachedGameLists>) -> Self {
+            Self {
+                state: Mutex::new(MonitorState {
+                    game_lists,
+                    revision: 0,
+                    quit: false,
+                }),
+                wake: Condvar::new(),
+            }
+        }
+
+        fn game_lists(&self) -> Option<(Arc<CachedGameLists>, u64)> {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            (!state.quit).then(|| (Arc::clone(&state.game_lists), state.revision))
+        }
+
+        fn replace_game_lists(&self, game_lists: Arc<CachedGameLists>) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.game_lists = game_lists;
+            state.revision = state.revision.wrapping_add(1);
+            drop(state);
+            self.wake.notify_one();
+        }
+
+        fn wait_for_next_scan(&self, scanned_revision: u64) -> bool {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.quit {
+                return false;
+            }
+            if state.revision == scanned_revision {
+                let (new_state, _) = self
+                    .wake
+                    .wait_timeout(state, POLL_INTERVAL)
+                    .unwrap_or_else(|error| error.into_inner());
+                state = new_state;
+            }
+            !state.quit
+        }
+
+        fn shutdown(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.quit = true;
+            drop(state);
+            self.wake.notify_one();
+        }
+    }
+
+    fn monitor_games(control: Arc<MonitorControl>) {
         let mut was_running = false;
         let mut initialized = false;
         let mut hdr_snapshot = None;
 
-        while !quit.load(Ordering::SeqCst) {
-            let game_list_flags = active_game_list_flags.load(Ordering::SeqCst);
-            let games = load_game_list(&game_list_paths, game_list_flags);
-            let exclusions = load_list(&game_list_paths.exclusions);
-            let is_running = match matching_game_processes(&games, &exclusions) {
-                Ok(matches) => !matches.is_empty(),
-                Err(_) => {
-                    sleep_until_next_poll(&quit);
-                    continue;
-                }
-            };
+        while let Some((game_lists, revision)) = control.game_lists() {
+            let is_running =
+                match matching_game_processes(&game_lists.games, &game_lists.exclusions) {
+                    Ok(matches) => !matches.is_empty(),
+                    Err(_) => {
+                        if !control.wait_for_next_scan(revision) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
 
             if !initialized {
                 initialized = true;
@@ -553,44 +637,58 @@ mod app {
             }
 
             was_running = is_running;
-            sleep_until_next_poll(&quit);
+            if !control.wait_for_next_scan(revision) {
+                break;
+            }
         }
     }
 
-    fn sleep_until_next_poll(quit: &AtomicBool) {
-        let mut slept = Duration::ZERO;
-        while slept < POLL_INTERVAL && !quit.load(Ordering::SeqCst) {
-            let step = Duration::from_millis(100);
-            thread::sleep(step);
-            slept += step;
-        }
+    fn load_cached_game_lists(paths: &GameListPaths, flags: usize) -> io::Result<CachedGameLists> {
+        Ok(CachedGameLists {
+            games: ProcessRules::from_entries(load_game_list(paths, flags)?),
+            exclusions: ProcessRules::from_entries(load_list(&paths.exclusions)?),
+        })
     }
 
-    fn load_game_list(paths: &GameListPaths, flags: usize) -> Vec<String> {
+    fn replace_cached_game_lists(
+        control: &MonitorControl,
+        paths: &GameListPaths,
+        flags: usize,
+    ) -> io::Result<()> {
+        let game_lists = Arc::new(load_cached_game_lists(paths, flags)?);
+        control.replace_game_lists(game_lists);
+        Ok(())
+    }
+
+    fn load_game_list(paths: &GameListPaths, flags: usize) -> io::Result<Vec<String>> {
         let mut games = Vec::new();
         let mut seen = HashSet::new();
         if flags & GAME_LIST_DEFAULT_FLAG != 0 {
-            append_game_list(&mut games, &mut seen, &paths.default);
+            append_game_list(&mut games, &mut seen, &paths.default)?;
         }
-        append_game_list(&mut games, &mut seen, &paths.custom);
-        games
+        append_game_list(&mut games, &mut seen, &paths.custom)?;
+        Ok(games)
     }
 
-    fn load_list(path: &Path) -> Vec<String> {
+    fn load_list(path: &Path) -> io::Result<Vec<String>> {
         let mut entries = Vec::new();
         let mut seen = HashSet::new();
-        append_game_list(&mut entries, &mut seen, path);
-        entries
+        append_game_list(&mut entries, &mut seen, path)?;
+        Ok(entries)
     }
 
-    fn append_game_list(games: &mut Vec<String>, seen: &mut HashSet<String>, path: &Path) {
-        if let Ok(contents) = fs::read_to_string(path) {
-            for game in contents.lines().filter_map(normalize_game_name) {
-                if seen.insert(game.clone()) {
-                    games.push(game);
-                }
+    fn append_game_list(
+        games: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        path: &Path,
+    ) -> io::Result<()> {
+        let contents = fs::read_to_string(path)?;
+        for game in contents.lines().filter_map(normalize_game_name) {
+            if seen.insert(game.clone()) {
+                games.push(game);
             }
         }
+        Ok(())
     }
 
     fn normalize_game_name(line: &str) -> Option<String> {
@@ -612,17 +710,14 @@ mod app {
     }
 
     fn matching_game_processes(
-        game_names: &[String],
-        exclusions: &[String],
+        game_names: &ProcessRules,
+        exclusions: &ProcessRules,
     ) -> io::Result<HashSet<String>> {
         let mut matches = HashSet::new();
-        if game_names.is_empty() {
+        if game_names.names.is_empty() && game_names.paths.is_empty() {
             return Ok(matches);
         }
-        let needs_path = game_names
-            .iter()
-            .chain(exclusions)
-            .any(|rule| is_path_rule(rule));
+        let needs_path = game_names.needs_process_path() || exclusions.needs_process_path();
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
@@ -690,23 +785,15 @@ mod app {
         }
     }
 
-    fn process_matches(exe_name: &str, process_path: Option<&str>, game_names: &[String]) -> bool {
+    fn process_matches(exe_name: &str, process_path: Option<&str>, rules: &ProcessRules) -> bool {
         let exe_key = normalize_process_key(exe_name);
-        game_names.iter().any(|game| {
-            if is_path_rule(game) {
-                return process_path.is_some_and(|path| path.eq_ignore_ascii_case(game));
-            }
-            if game == &exe_key {
-                return true;
-            }
-
-            let game_key = normalize_process_key(game);
-            let can_prefix_match = game_key.len() >= 5;
-            !game_key.is_empty()
-                && (exe_key == game_key
-                    || (can_prefix_match && exe_key.starts_with(&game_key))
-                    || known_suffix_trim(&exe_key) == game_key)
-        })
+        rules.names.contains(&exe_key)
+            || rules.names.contains(known_suffix_trim(&exe_key))
+            || rules
+                .names
+                .iter()
+                .any(|game| game.len() >= 5 && exe_key.starts_with(game))
+            || process_path.is_some_and(|path| rules.paths.contains(path))
     }
 
     fn normalize_process_key(value: &str) -> String {
@@ -801,7 +888,10 @@ mod app {
                         let _ = toggle_windows_hdr();
                     }
                     MENU_USE_DEFAULT_LIST => {
-                        toggle_game_list_flag(GAME_LIST_DEFAULT_FLAG);
+                        let _ = toggle_game_list_flag(GAME_LIST_DEFAULT_FLAG);
+                    }
+                    MENU_RELOAD_GAME_LISTS => {
+                        let _ = reload_game_lists();
                     }
                     MENU_EDIT_CUSTOM_LIST => {
                         let _ = edit_custom_game_list();
@@ -813,8 +903,8 @@ mod app {
                         let _ = set_startup_enabled(!startup_enabled());
                     }
                     MENU_QUIT => {
-                        if let Some(quit) = QUIT_FLAG.get() {
-                            quit.store(true, Ordering::SeqCst);
+                        if let Some(control) = MONITOR_CONTROL.get() {
+                            control.shutdown();
                         }
                         DestroyWindow(hwnd);
                     }
@@ -823,8 +913,8 @@ mod app {
                 0
             }
             WM_CLOSE => {
-                if let Some(quit) = QUIT_FLAG.get() {
-                    quit.store(true, Ordering::SeqCst);
+                if let Some(control) = MONITOR_CONTROL.get() {
+                    control.shutdown();
                 }
                 DestroyWindow(hwnd);
                 0
@@ -846,6 +936,7 @@ mod app {
 
         let toggle = to_wide_null(toggle_hdr_menu_text());
         let default_list = to_wide_null("Use default game list");
+        let reload_game_lists = to_wide_null("Reload game lists");
         let edit_custom_list = to_wide_null("Edit custom game list");
         let edit_exclusion_list = to_wide_null("Edit exclusion list");
         let startup = to_wide_null("Run at Windows startup");
@@ -859,6 +950,12 @@ mod app {
             MF_STRING | checked_if(current_game_list_flags & GAME_LIST_DEFAULT_FLAG != 0),
             MENU_USE_DEFAULT_LIST,
             default_list.as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_RELOAD_GAME_LISTS,
+            reload_game_lists.as_ptr(),
         );
         AppendMenuW(
             menu,
@@ -1209,12 +1306,30 @@ mod app {
             .unwrap_or(INITIAL_GAME_LIST_FLAGS)
     }
 
-    fn toggle_game_list_flag(flag: usize) {
-        if let Some(active_flags) = ACTIVE_GAME_LIST_FLAGS.get() {
-            let previous_flags = active_flags.fetch_xor(flag, Ordering::SeqCst);
-            let new_flags = previous_flags ^ flag;
-            let _ = save_game_list_flags(new_flags);
-        }
+    fn reload_game_lists() -> io::Result<()> {
+        reload_game_lists_for_flags(game_list_flags())
+    }
+
+    fn reload_game_lists_for_flags(flags: usize) -> io::Result<()> {
+        let paths = GAME_LIST_PATHS.get().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "game list paths are unavailable")
+        })?;
+        let control = MONITOR_CONTROL.get().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "monitor control is unavailable")
+        })?;
+        replace_cached_game_lists(control, paths, flags)
+    }
+
+    fn toggle_game_list_flag(flag: usize) -> io::Result<()> {
+        let active_flags = ACTIVE_GAME_LIST_FLAGS.get().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "game list flags are unavailable")
+        })?;
+        let previous_flags = active_flags.load(Ordering::SeqCst);
+        let new_flags = sanitize_game_list_flags(previous_flags ^ flag);
+
+        reload_game_lists_for_flags(new_flags)?;
+        active_flags.store(new_flags, Ordering::SeqCst);
+        save_game_list_flags(new_flags)
     }
 
     fn load_saved_game_list_flags() -> Option<usize> {
@@ -1808,7 +1923,7 @@ mod app {
             fs::write(&paths.default, "Game.exe\n\"Other Game.exe\"\n")?;
             fs::write(&paths.custom, "game\nthird.exe\nother game.exe\n")?;
 
-            let games = load_game_list(&paths, GAME_LIST_DEFAULT_FLAG | GAME_LIST_CUSTOM_FLAG);
+            let games = load_game_list(&paths, GAME_LIST_DEFAULT_FLAG | GAME_LIST_CUSTOM_FLAG)?;
 
             fs::remove_dir_all(&dir)?;
             assert_eq!(
@@ -1835,10 +1950,42 @@ mod app {
             fs::write(&paths.default, "game.exe\n")?;
             fs::write(&paths.custom, "other.exe\n")?;
 
-            let games = load_game_list(&paths, 0);
+            let games = load_game_list(&paths, 0)?;
 
             fs::remove_dir_all(&dir)?;
             assert_eq!(games, vec!["other".to_string()]);
+            Ok(())
+        }
+
+        #[test]
+        fn failed_reload_keeps_previous_cached_lists() -> io::Result<()> {
+            let dir = unique_temp_dir("failed-reload");
+            fs::create_dir_all(&dir)?;
+            let paths = GameListPaths {
+                default: dir.join("games_default.txt"),
+                custom: dir.join("games_custom.txt"),
+                exclusions: dir.join("games_excluded.txt"),
+            };
+
+            fs::write(&paths.default, "default.exe\n")?;
+            fs::write(&paths.custom, "old.exe\n")?;
+            fs::write(&paths.exclusions, "excluded.exe\n")?;
+            let initial = Arc::new(load_cached_game_lists(&paths, ALL_GAME_LIST_FLAGS)?);
+            let control = MonitorControl::new(Arc::clone(&initial));
+
+            fs::write(&paths.custom, "new.exe\n")?;
+            fs::remove_file(&paths.exclusions)?;
+            assert!(replace_cached_game_lists(&control, &paths, ALL_GAME_LIST_FLAGS).is_err());
+
+            let (cached, revision) = control
+                .game_lists()
+                .expect("monitor should still be active");
+            assert!(Arc::ptr_eq(&cached, &initial));
+            assert_eq!(revision, 0);
+            assert!(cached.games.names.contains("old"));
+            assert!(!cached.games.names.contains("new"));
+
+            fs::remove_dir_all(&dir)?;
             Ok(())
         }
 
@@ -1850,7 +1997,10 @@ mod app {
 
         #[test]
         fn full_path_rules_match_only_the_exact_process_path() {
-            let rules = vec![normalize_game_name(r"D:\Games\launcher.exe").unwrap()];
+            let rules =
+                ProcessRules::from_entries(vec![
+                    normalize_game_name(r"D:\Games\launcher.exe").unwrap()
+                ]);
 
             assert!(process_matches(
                 "launcher.exe",
@@ -1866,7 +2016,8 @@ mod app {
 
         #[test]
         fn executable_name_rules_still_match_without_a_process_path() {
-            let rules = vec![normalize_game_name("launcher.exe").unwrap()];
+            let rules =
+                ProcessRules::from_entries(vec![normalize_game_name("launcher.exe").unwrap()]);
             assert!(process_matches("Launcher.exe", None, &rules));
         }
 
