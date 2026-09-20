@@ -787,12 +787,9 @@ mod app {
 
     fn process_matches(exe_name: &str, process_path: Option<&str>, rules: &ProcessRules) -> bool {
         let exe_key = normalize_process_key(exe_name);
+        let exe_without_known_suffix = known_suffix_trim(&exe_key);
         rules.names.contains(&exe_key)
-            || rules.names.contains(known_suffix_trim(&exe_key))
-            || rules
-                .names
-                .iter()
-                .any(|game| game.len() >= 5 && exe_key.starts_with(game))
+            || rules.names.contains(exe_without_known_suffix)
             || process_path.is_some_and(|path| rules.paths.contains(path))
     }
 
@@ -2019,6 +2016,25 @@ mod app {
             let rules =
                 ProcessRules::from_entries(vec![normalize_game_name("launcher.exe").unwrap()]);
             assert!(process_matches("Launcher.exe", None, &rules));
+        }
+
+        #[test]
+        fn executable_name_rules_do_not_match_arbitrary_prefixes() {
+            let rules = ProcessRules::from_entries(vec![normalize_game_name("disco.exe").unwrap()]);
+
+            assert!(process_matches("disco.exe", None, &rules));
+            assert!(!process_matches("Discord.exe", None, &rules));
+        }
+
+        #[test]
+        fn executable_name_rules_match_explicit_known_suffixes() {
+            let rules =
+                ProcessRules::from_entries(vec![normalize_game_name("stalker2.exe").unwrap()]);
+
+            assert!(process_matches("Stalker2-Win64-Shipping.exe", None, &rules));
+            assert!(process_matches("Stalker2-x64.exe", None, &rules));
+            assert!(process_matches("Stalker2-DX11.exe", None, &rules));
+            assert!(process_matches("Stalker2-DX12.exe", None, &rules));
         }
 
         #[test]
