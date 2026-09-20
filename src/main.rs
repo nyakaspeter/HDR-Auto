@@ -524,6 +524,7 @@ mod app {
     struct ProcessRules {
         names: HashSet<String>,
         paths: HashSet<String>,
+        path_executable_names: HashSet<String>,
     }
 
     impl ProcessRules {
@@ -531,6 +532,12 @@ mod app {
             let mut rules = Self::default();
             for entry in entries {
                 if is_path_rule(&entry) {
+                    if let Some(executable_name) = entry.rsplit('\\').next() {
+                        let executable_key = normalize_process_key(executable_name);
+                        if !executable_key.is_empty() {
+                            rules.path_executable_names.insert(executable_key);
+                        }
+                    }
                     rules.paths.insert(entry);
                 } else {
                     rules.names.insert(normalize_process_key(&entry));
@@ -540,8 +547,13 @@ mod app {
             rules
         }
 
-        fn needs_process_path(&self) -> bool {
-            !self.paths.is_empty()
+        fn has_path_candidate(&self, executable_key: &str) -> bool {
+            self.path_executable_names.contains(executable_key)
+        }
+
+        fn name_matches(&self, executable_key: &str) -> bool {
+            self.names.contains(executable_key)
+                || self.names.contains(known_suffix_trim(executable_key))
         }
     }
 
@@ -616,8 +628,8 @@ mod app {
 
         while let Some((game_lists, revision)) = control.game_lists() {
             let is_running =
-                match matching_game_processes(&game_lists.games, &game_lists.exclusions) {
-                    Ok(matches) => !matches.is_empty(),
+                match matching_game_process_is_running(&game_lists.games, &game_lists.exclusions) {
+                    Ok(is_running) => is_running,
                     Err(_) => {
                         if !control.wait_for_next_scan(revision) {
                             break;
@@ -709,15 +721,13 @@ mod app {
         value.contains('\\') || Path::new(value).is_absolute()
     }
 
-    fn matching_game_processes(
+    fn matching_game_process_is_running(
         game_names: &ProcessRules,
         exclusions: &ProcessRules,
-    ) -> io::Result<HashSet<String>> {
-        let mut matches = HashSet::new();
+    ) -> io::Result<bool> {
         if game_names.names.is_empty() && game_names.paths.is_empty() {
-            return Ok(matches);
+            return Ok(false);
         }
-        let needs_path = game_names.needs_process_path() || exclusions.needs_process_path();
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
@@ -729,18 +739,37 @@ mod app {
         entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as DWORD;
 
         if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-            return Ok(matches);
+            return Ok(false);
         }
 
+        let mut executable_key = String::with_capacity(64);
+        let mut path_buffer = Vec::new();
+        let mut process_path = String::new();
         loop {
-            let exe_name = fixed_wide_to_string(&entry.szExeFile);
-            let process_path = needs_path
-                .then(|| process_image_path(entry.th32ProcessID))
-                .flatten();
-            if process_matches(&exe_name, process_path.as_deref(), game_names)
-                && !process_matches(&exe_name, process_path.as_deref(), exclusions)
-            {
-                matches.insert(exe_name);
+            normalize_wide_process_key(&entry.szExeFile, &mut executable_key);
+
+            if !exclusions.name_matches(&executable_key) {
+                let name_matches = game_names.name_matches(&executable_key);
+                let game_path_candidate =
+                    !name_matches && game_names.has_path_candidate(&executable_key);
+
+                if name_matches || game_path_candidate {
+                    let exclusion_path_candidate = exclusions.has_path_candidate(&executable_key);
+                    let needs_path = game_path_candidate || exclusion_path_candidate;
+                    let has_path = needs_path
+                        && process_image_path(
+                            entry.th32ProcessID,
+                            &mut path_buffer,
+                            &mut process_path,
+                        );
+                    let path = has_path.then_some(process_path.as_str());
+
+                    if (name_matches || path.is_some_and(|path| game_names.paths.contains(path)))
+                        && !path.is_some_and(|path| exclusions.paths.contains(path))
+                    {
+                        return Ok(true);
+                    }
+                }
             }
 
             if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
@@ -748,10 +777,10 @@ mod app {
             }
         }
 
-        Ok(matches)
+        Ok(false)
     }
 
-    fn process_image_path(process_id: DWORD) -> Option<String> {
+    fn process_image_path(process_id: DWORD, buffer: &mut Vec<u16>, output: &mut String) -> bool {
         let handle = unsafe {
             OpenProcess(
                 winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION,
@@ -760,19 +789,27 @@ mod app {
             )
         };
         if handle.is_null() {
-            return None;
+            return false;
         }
         let _handle = SnapshotHandle(handle);
-        let mut buffer = vec![0u16; 32_768];
+        buffer.resize(32_768, 0);
         let mut len = buffer.len() as DWORD;
         if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut len) } == 0 {
-            return None;
+            return false;
         }
-        Some(
-            String::from_utf16_lossy(&buffer[..len as usize])
-                .replace('/', "\\")
-                .to_ascii_lowercase(),
-        )
+        output.clear();
+        output.extend(
+            char::decode_utf16(buffer[..len as usize].iter().copied())
+                .map(|decoded| decoded.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .map(|character| {
+                    if character == '/' {
+                        '\\'
+                    } else {
+                        character.to_ascii_lowercase()
+                    }
+                }),
+        );
+        true
     }
 
     struct SnapshotHandle(winapi::shared::ntdef::HANDLE);
@@ -785,23 +822,55 @@ mod app {
         }
     }
 
+    #[cfg(test)]
     fn process_matches(exe_name: &str, process_path: Option<&str>, rules: &ProcessRules) -> bool {
         let exe_key = normalize_process_key(exe_name);
-        let exe_without_known_suffix = known_suffix_trim(&exe_key);
-        rules.names.contains(&exe_key)
-            || rules.names.contains(exe_without_known_suffix)
-            || process_path.is_some_and(|path| rules.paths.contains(path))
+        rules.name_matches(&exe_key) || process_path.is_some_and(|path| rules.paths.contains(path))
     }
 
     fn normalize_process_key(value: &str) -> String {
-        let lower = value.trim().trim_matches('"').to_ascii_lowercase();
-        lower
-            .strip_suffix(".exe")
-            .unwrap_or(&lower)
+        let value = value.trim().trim_matches('"');
+        let value = if value.len() >= 4
+            && value.as_bytes()[value.len() - 4..].eq_ignore_ascii_case(b".exe")
+        {
+            &value[..value.len() - 4]
+        } else {
+            value
+        };
+        value
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .flat_map(|c| c.to_lowercase())
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
             .collect()
+    }
+
+    fn normalize_wide_process_key(value: &[u16], output: &mut String) {
+        let mut end = value
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(value.len());
+        while end > 0 && matches!(value[end - 1], 0x20 | 0x09 | 0x0d | 0x0a | 0x22) {
+            end -= 1;
+        }
+        let mut start = 0;
+        while start < end && matches!(value[start], 0x20 | 0x09 | 0x0d | 0x0a | 0x22) {
+            start += 1;
+        }
+        if end.saturating_sub(start) >= 4
+            && value[end - 4] == 0x2e
+            && matches!(value[end - 3], 0x45 | 0x65)
+            && matches!(value[end - 2], 0x58 | 0x78)
+            && matches!(value[end - 1], 0x45 | 0x65)
+        {
+            end -= 4;
+        }
+
+        output.clear();
+        output.extend(value[start..end].iter().filter_map(|&unit| {
+            let byte = u8::try_from(unit).ok()?;
+            byte.is_ascii_alphanumeric()
+                .then(|| char::from(byte.to_ascii_lowercase()))
+        }));
     }
 
     fn known_suffix_trim(value: &str) -> &str {
@@ -1886,11 +1955,6 @@ mod app {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
     }
 
-    fn fixed_wide_to_string(value: &[u16]) -> String {
-        let len = value.iter().position(|&c| c == 0).unwrap_or(value.len());
-        String::from_utf16_lossy(&value[..len])
-    }
-
     fn copy_to_fixed_wide(target: &mut [u16], value: &str) {
         if target.is_empty() {
             return;
@@ -1999,6 +2063,8 @@ mod app {
                     normalize_game_name(r"D:\Games\launcher.exe").unwrap()
                 ]);
 
+            assert!(rules.has_path_candidate("launcher"));
+            assert!(!rules.has_path_candidate("other"));
             assert!(process_matches(
                 "launcher.exe",
                 Some(r"d:\games\launcher.exe"),
@@ -2035,6 +2101,19 @@ mod app {
             assert!(process_matches("Stalker2-x64.exe", None, &rules));
             assert!(process_matches("Stalker2-DX11.exe", None, &rules));
             assert!(process_matches("Stalker2-DX12.exe", None, &rules));
+        }
+
+        #[test]
+        fn wide_process_names_are_normalized_into_a_reusable_buffer() {
+            let mut normalized = String::with_capacity(64);
+            normalize_wide_process_key(
+                &to_wide_null("Stalker2-Win64-Shipping.EXE"),
+                &mut normalized,
+            );
+            assert_eq!(normalized, "stalker2win64shipping");
+
+            normalize_wide_process_key(&to_wide_null("Discord.exe"), &mut normalized);
+            assert_eq!(normalized, "discord");
         }
 
         #[test]
