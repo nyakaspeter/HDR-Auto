@@ -15,7 +15,7 @@ mod app {
         ptr,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Condvar, Mutex, OnceLock,
+            Arc, Mutex, OnceLock,
         },
         thread,
         time::Duration,
@@ -42,13 +42,16 @@ mod app {
                 Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
                 NOTIFYICONDATAW,
             },
-            synchapi::CreateMutexW,
+            synchapi::{
+                CreateEventW, CreateMutexW, ResetEvent, SetEvent, WaitForMultipleObjects,
+                WaitForSingleObject,
+            },
             tlhelp32::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
             unknwnbase::IUnknown,
-            winbase::QueryFullProcessImageNameW,
+            winbase::{QueryFullProcessImageNameW, INFINITE, WAIT_FAILED},
             wingdi::{
                 DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
                 DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -57,7 +60,7 @@ mod app {
                 DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
                 DISPLAYCONFIG_TOPOLOGY_ID, QDC_ONLY_ACTIVE_PATHS,
             },
-            winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ},
+            winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ, SYNCHRONIZE},
             winreg::{
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
                 RegSetValueExW, HKEY_CURRENT_USER,
@@ -235,7 +238,7 @@ mod app {
             &game_list_paths,
             initial_game_list_flags,
         )?);
-        let monitor_control = Arc::new(MonitorControl::new(initial_game_lists));
+        let monitor_control = Arc::new(MonitorControl::new(initial_game_lists)?);
         let active_game_list_flags = Arc::new(AtomicUsize::new(initial_game_list_flags));
         let monitor_thread_control = Arc::clone(&monitor_control);
         let _ = MONITOR_CONTROL.set(Arc::clone(&monitor_control));
@@ -570,19 +573,24 @@ mod app {
 
     struct MonitorControl {
         state: Mutex<MonitorState>,
-        wake: Condvar,
+        wake_event: EventHandle,
     }
 
     impl MonitorControl {
-        fn new(game_lists: Arc<CachedGameLists>) -> Self {
-            Self {
+        fn new(game_lists: Arc<CachedGameLists>) -> io::Result<Self> {
+            let wake_event = unsafe { CreateEventW(ptr::null_mut(), TRUE, 0, ptr::null()) };
+            if wake_event.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(Self {
                 state: Mutex::new(MonitorState {
                     game_lists,
                     revision: 0,
                     quit: false,
                 }),
-                wake: Condvar::new(),
-            }
+                wake_event: EventHandle(wake_event),
+            })
         }
 
         fn game_lists(&self) -> Option<(Arc<CachedGameLists>, u64)> {
@@ -594,30 +602,98 @@ mod app {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.game_lists = game_lists;
             state.revision = state.revision.wrapping_add(1);
-            drop(state);
-            self.wake.notify_one();
+            unsafe {
+                SetEvent(self.wake_event.0);
+            }
         }
 
         fn wait_for_next_scan(&self, scanned_revision: u64) -> bool {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            match self.prepare_wait(scanned_revision) {
+                WaitPreparation::Quit => false,
+                WaitPreparation::Rescan => true,
+                WaitPreparation::Wait => {
+                    unsafe {
+                        WaitForSingleObject(self.wake_event.0, POLL_INTERVAL.as_millis() as DWORD);
+                    }
+                    !self.quit_requested()
+                }
+            }
+        }
+
+        fn wait_for_process_exit_or_control(
+            &self,
+            process_handle: HANDLE,
+            scanned_revision: u64,
+        ) -> bool {
+            match self.prepare_wait(scanned_revision) {
+                WaitPreparation::Quit => false,
+                WaitPreparation::Rescan => true,
+                WaitPreparation::Wait => {
+                    let handles = [self.wake_event.0, process_handle];
+                    let result = unsafe {
+                        WaitForMultipleObjects(
+                            handles.len() as DWORD,
+                            handles.as_ptr(),
+                            0,
+                            INFINITE,
+                        )
+                    };
+                    if result == WAIT_FAILED {
+                        return self.wait_for_next_scan(scanned_revision);
+                    }
+                    !self.quit_requested()
+                }
+            }
+        }
+
+        fn prepare_wait(&self, scanned_revision: u64) -> WaitPreparation {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.quit {
-                return false;
+                return WaitPreparation::Quit;
             }
-            if state.revision == scanned_revision {
-                let (new_state, _) = self
-                    .wake
-                    .wait_timeout(state, POLL_INTERVAL)
-                    .unwrap_or_else(|error| error.into_inner());
-                state = new_state;
+            if state.revision != scanned_revision {
+                return WaitPreparation::Rescan;
             }
-            !state.quit
+
+            unsafe {
+                ResetEvent(self.wake_event.0);
+            }
+            WaitPreparation::Wait
+        }
+
+        fn quit_requested(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .quit
         }
 
         fn shutdown(&self) {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.quit = true;
-            drop(state);
-            self.wake.notify_one();
+            unsafe {
+                SetEvent(self.wake_event.0);
+            }
+        }
+    }
+
+    enum WaitPreparation {
+        Quit,
+        Rescan,
+        Wait,
+    }
+
+    struct EventHandle(HANDLE);
+
+    // Windows event handles are designed to be signaled and waited on across threads.
+    unsafe impl Send for EventHandle {}
+    unsafe impl Sync for EventHandle {}
+
+    impl Drop for EventHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
     }
 
@@ -627,9 +703,9 @@ mod app {
         let mut hdr_snapshot = None;
 
         while let Some((game_lists, revision)) = control.game_lists() {
-            let is_running =
-                match matching_game_process_is_running(&game_lists.games, &game_lists.exclusions) {
-                    Ok(is_running) => is_running,
+            let matching_process =
+                match matching_game_process(&game_lists.games, &game_lists.exclusions) {
+                    Ok(matching_process) => matching_process,
                     Err(_) => {
                         if !control.wait_for_next_scan(revision) {
                             break;
@@ -637,6 +713,7 @@ mod app {
                         continue;
                     }
                 };
+            let is_running = matching_process.is_some();
 
             if !initialized {
                 initialized = true;
@@ -649,7 +726,12 @@ mod app {
             }
 
             was_running = is_running;
-            if !control.wait_for_next_scan(revision) {
+            let should_continue = matching_process
+                .as_ref()
+                .and_then(|process| process.wait_handle.as_ref())
+                .map(|handle| control.wait_for_process_exit_or_control(handle.0, revision))
+                .unwrap_or_else(|| control.wait_for_next_scan(revision));
+            if !should_continue {
                 break;
             }
         }
@@ -721,12 +803,16 @@ mod app {
         value.contains('\\') || Path::new(value).is_absolute()
     }
 
-    fn matching_game_process_is_running(
+    struct MatchingProcess {
+        wait_handle: Option<SnapshotHandle>,
+    }
+
+    fn matching_game_process(
         game_names: &ProcessRules,
         exclusions: &ProcessRules,
-    ) -> io::Result<bool> {
+    ) -> io::Result<Option<MatchingProcess>> {
         if game_names.names.is_empty() && game_names.paths.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -739,7 +825,7 @@ mod app {
         entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as DWORD;
 
         if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut executable_key = String::with_capacity(64);
@@ -767,7 +853,9 @@ mod app {
                     if (name_matches || path.is_some_and(|path| game_names.paths.contains(path)))
                         && !path.is_some_and(|path| exclusions.paths.contains(path))
                     {
-                        return Ok(true);
+                        return Ok(Some(MatchingProcess {
+                            wait_handle: open_process_wait_handle(entry.th32ProcessID),
+                        }));
                     }
                 }
             }
@@ -777,7 +865,12 @@ mod app {
             }
         }
 
-        Ok(false)
+        Ok(None)
+    }
+
+    fn open_process_wait_handle(process_id: DWORD) -> Option<SnapshotHandle> {
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, process_id) };
+        (!handle.is_null()).then_some(SnapshotHandle(handle))
     }
 
     fn process_image_path(process_id: DWORD, buffer: &mut Vec<u16>, output: &mut String) -> bool {
@@ -2032,7 +2125,7 @@ mod app {
             fs::write(&paths.custom, "old.exe\n")?;
             fs::write(&paths.exclusions, "excluded.exe\n")?;
             let initial = Arc::new(load_cached_game_lists(&paths, ALL_GAME_LIST_FLAGS)?);
-            let control = MonitorControl::new(Arc::clone(&initial));
+            let control = MonitorControl::new(Arc::clone(&initial))?;
 
             fs::write(&paths.custom, "new.exe\n")?;
             fs::remove_file(&paths.exclusions)?;
@@ -2047,6 +2140,31 @@ mod app {
             assert!(!cached.games.names.contains("new"));
 
             fs::remove_dir_all(&dir)?;
+            Ok(())
+        }
+
+        #[test]
+        fn control_change_wakes_an_active_process_wait() -> io::Result<()> {
+            let initial = Arc::new(CachedGameLists {
+                games: ProcessRules::default(),
+                exclusions: ProcessRules::default(),
+            });
+            let control = Arc::new(MonitorControl::new(initial)?);
+            let revision = control.game_lists().expect("monitor should be active").1;
+            let waiting_control = Arc::clone(&control);
+
+            let waiter = thread::spawn(move || {
+                let process = open_process_wait_handle(std::process::id())
+                    .expect("the current process should be waitable");
+                waiting_control.wait_for_process_exit_or_control(process.0, revision)
+            });
+
+            control.replace_game_lists(Arc::new(CachedGameLists {
+                games: ProcessRules::default(),
+                exclusions: ProcessRules::default(),
+            }));
+
+            assert!(waiter.join().expect("wait thread should finish"));
             Ok(())
         }
 
