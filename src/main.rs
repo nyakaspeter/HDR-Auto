@@ -951,12 +951,6 @@ mod app {
         AppendMenuW(
             menu,
             MF_STRING,
-            MENU_RELOAD_GAME_LISTS,
-            reload_game_lists.as_ptr(),
-        );
-        AppendMenuW(
-            menu,
-            MF_STRING,
             MENU_EDIT_CUSTOM_LIST,
             edit_custom_list.as_ptr(),
         );
@@ -965,6 +959,12 @@ mod app {
             MF_STRING,
             MENU_EDIT_EXCLUSION_LIST,
             edit_exclusion_list.as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_RELOAD_GAME_LISTS,
+            reload_game_lists.as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
