@@ -16,6 +16,8 @@ MonsterHunterWilds.exe
 
 The custom list is always active and may be left empty. Entries are case insensitive and the `.exe` extension is optional for executable names. You can edit it by clicking "Edit custom game list" in the system tray menu.
 
+Background shader compilation workers launched by SCSKiller's `scskiller_warm.exe` are automatically ignored, even when they use a game's executable name. Games launched normally still trigger HDR while SCSKiller is open.
+
 Use "Edit exclusion list" to prevent entries from either the community or custom list from triggering HDR. Both lists also accept full executable paths. A filename such as `launcher.exe` matches that executable anywhere, while a full path such as `D:\Games\launcher.exe` matches only that exact executable. Full-path entries should include the `.exe` extension.
 
 ## Building from source
@@ -28,4 +30,4 @@ cargo build --release
 The compiled executable will be created at `target/release/hdr-auto.exe`.
 
 ## Contributing
-You may contribute to the community list by editing the games_default.txt and creating a pull request. Please ensure the game you add is not already in the list, and is listed as "Native support" on the [PCGamingWiki HDR Page](https://www.pcgamingwiki.com/wiki/List_of_games_that_support_high_dynamic_range_display_(HDR)). Also ensure the .exe name is correct by running it on your computer and checking the HDR toggles on as intended.
+You may contribute to the community list by editing games_default.txt and creating a pull request. Games should support native HDR output, including limited native or automatically enabled HDR as documented on the [PCGamingWiki HDR Page](https://www.pcgamingwiki.com/wiki/List_of_games_that_support_high_dynamic_range_display_(HDR)). Games that require a mod to add HDR belong in your custom list. Verify the actual game executable rather than deriving its name from the title, and avoid shared launchers, editors, and generic executable names. Where possible, run the game and check that HDR toggles on as intended.

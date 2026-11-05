@@ -96,7 +96,7 @@ mod app {
     const STARTUP_REGISTRY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const STARTUP_REGISTRY_VALUE_NAME: &str = APP_NAME;
     const DEFAULT_GAME_LIST_URL: &str =
-        "https://raw.githubusercontent.com/noahz123/HDR-Auto/main/games_default.txt";
+        "https://raw.githubusercontent.com/nyakaspeter/HDR-Auto/main/games_default.txt";
     const GAME_LIST_DEFAULT_FLAG: usize = 0b01;
     const GAME_LIST_CUSTOM_FLAG: usize = 0b10;
     const ALL_GAME_LIST_FLAGS: usize = GAME_LIST_DEFAULT_FLAG | GAME_LIST_CUSTOM_FLAG;
@@ -829,12 +829,30 @@ mod app {
         }
 
         let mut executable_key = String::with_capacity(64);
+        // SCSKiller stages its compiler under the game's executable name. Identify
+        // its launcher in the same snapshot, without excluding a real game that
+        // happens to run while SCSKiller is open.
+        let mut shader_compiler_parents = HashSet::new();
+        loop {
+            if is_shader_compiler_launcher(&entry.szExeFile) {
+                shader_compiler_parents.insert(entry.th32ProcessID);
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+        if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+            return Ok(None);
+        }
+
         let mut path_buffer = Vec::new();
         let mut process_path = String::new();
         loop {
             normalize_wide_process_key(&entry.szExeFile, &mut executable_key);
 
-            if !exclusions.name_matches(&executable_key) {
+            if !shader_compiler_parents.contains(&entry.th32ParentProcessID)
+                && !exclusions.name_matches(&executable_key)
+            {
                 let name_matches = game_names.name_matches(&executable_key);
                 let game_path_candidate =
                     !name_matches && game_names.has_path_candidate(&executable_key);
@@ -871,6 +889,14 @@ mod app {
     fn open_process_wait_handle(process_id: DWORD) -> Option<SnapshotHandle> {
         let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, process_id) };
         (!handle.is_null()).then_some(SnapshotHandle(handle))
+    }
+
+    fn is_shader_compiler_launcher(executable: &[u16]) -> bool {
+        let end = executable
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(executable.len());
+        String::from_utf16_lossy(&executable[..end]).eq_ignore_ascii_case("scskiller_warm.exe")
     }
 
     fn process_image_path(process_id: DWORD, buffer: &mut Vec<u16>, output: &mut String) -> bool {
@@ -2063,6 +2089,24 @@ mod app {
     mod tests {
         use super::*;
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn shader_compiler_launcher_requires_its_exact_executable_name() {
+            assert!(is_shader_compiler_launcher(&to_wide_null(
+                "scskiller_warm.exe"
+            )));
+            assert!(is_shader_compiler_launcher(&to_wide_null(
+                "SCSKiller_Warm.EXE"
+            )));
+            for name in [
+                "SCSKiller.exe",
+                "game.exe",
+                "scskiller_warm_game.exe",
+                "scskillerwarm.exe",
+            ] {
+                assert!(!is_shader_compiler_launcher(&to_wide_null(name)), "{name}");
+            }
+        }
 
         #[test]
         fn load_game_list_deduplicates_across_enabled_lists() -> io::Result<()> {
